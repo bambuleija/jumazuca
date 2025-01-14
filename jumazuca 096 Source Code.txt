@@ -1,0 +1,412 @@
+# forwarder.py
+import ipaddress
+import os
+import socket
+import gzip
+import io
+import sys
+import time
+import json
+import datetime
+import threading
+
+# Constants used
+VERSION = "0.96"
+MAX_UDP_CHUNK_SEND_SIZE = 65000
+RCV_BUFFER_SIZE = 65535
+CHUNK_MAX_AMOUNT = 128
+CHUNK_MAX_AGE = 5
+SYSLOG_FACILITY_LOCAL_USE_7 = 23
+SYSLOG_SEVERITY_INFORMATIONAL = 6
+SYSLOG_VERSION = 1
+NILVALUE = "-"
+
+# Create a stop event
+stop_event = threading.Event()
+
+class GELFChunkStore:
+    def __init__(self, timeout=CHUNK_MAX_AGE):
+        # Store chunks by message ID with timestamps for expiration
+        self.chunks = {}
+        self.timeout = timeout  # seconds
+    
+    def add_chunk(self, message_id, chunk_index, total_chunks, chunk_data):
+        # Add a new chunk to the store
+        if message_id not in self.chunks:
+            self.chunks[message_id] = {
+                "chunks": [None] * total_chunks,  # Predefine array to hold chunks in order
+                "timestamp": time.time(),
+            }
+        
+        # Insert the chunk in the correct position
+        self.chunks[message_id]["chunks"][chunk_index] = chunk_data
+        self.chunks[message_id]["timestamp"] = time.time()  # Update timestamp
+
+    def is_complete(self, message_id):
+        # Check if all chunks for a message ID are present
+        return all(chunk is not None for chunk in self.chunks.get(message_id, {}).get("chunks", []))
+    
+    def get_message(self, message_id):
+        # Combine and return complete message if available
+        if self.is_complete(message_id):
+            message = b''.join(self.chunks[message_id]["chunks"])
+            del self.chunks[message_id]  # Clean up after retrieving message
+            return message
+        return None
+    def cleanup_expired(self):
+        # Track current time and collect expired message IDs
+        current_time = time.time()
+        expired_ids = [
+            msg_id for msg_id, entry in self.chunks.items()
+            if current_time - entry["timestamp"] > self.timeout
+        ]
+    
+        # Remove expired messages from the store
+        for msg_id in expired_ids:
+            del self.chunks[msg_id]
+    
+        # Return the list of expired message IDs
+        return expired_ids
+    
+from datetime import datetime, timedelta, timezone
+
+def convert_gelf_to_syslog_timestamp(gelf_timestamp):
+    # Convert from Unix epoch (seconds) to a UTC-aware datetime
+    dt = datetime.fromtimestamp(gelf_timestamp, tz=timezone.utc)
+    
+    # Add milliseconds or microseconds (if any)
+    fraction = gelf_timestamp % 1
+    fraction_ms = round(fraction * 1000)  # to milliseconds
+    dt = dt + timedelta(milliseconds=fraction_ms)
+    
+    # Format it in the syslog timestamp format (RFC 5424)
+    syslog_timestamp = dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]  # Limit to 3 decimal places for ms
+    syslog_timestamp = syslog_timestamp + "Z" #'+00:00'  # Add UTC timezone in RFC 5424 format
+    
+    return syslog_timestamp
+
+def find_json_value_by_key(data, target_key):
+    if isinstance(data, dict):  # Check if the data is a dictionary
+        for key, value in data.items():
+            if key == target_key:
+                return value
+            elif isinstance(value, (dict, list)):
+                result = find_json_value_by_key(value, target_key)
+                if result is not None:
+                    return result
+    elif isinstance(data, list):  # Check if the data is a list
+        for item in data:
+            result = find_json_value_by_key(item, target_key)
+            if result is not None:
+                return result
+    return None
+
+def is_data_gelf_chunk(data):
+    # Check if received data is GELF chunk (1e0f in hex)
+    if data[:2] == b'\x1e\x0f':
+        return True
+    return False
+
+def is_data_gzip_compressed(data):
+    # Check if received data is GELF chunk (1e0f in hex)
+    if data[:2] == b'\x1f\x8b':
+        return True
+    return False
+        
+def extract_gzip_data(data):
+    # Check if data starts with magic bytes for GZIP (1f8b in hex)
+    if data[:2] == b'\x1f\x8b':
+        try:
+            # Use io.BytesIO to read the gzip data
+            with gzip.GzipFile(fileobj=io.BytesIO(data)) as gz:
+                return gz.read()
+        except Exception as e:
+            print("Error decompressing GZIP data:", e)
+    #else:
+    #    print("Received data is not in GZIP format.")
+    return None
+
+def send_large_data(forward_socket, data, forward_ip, forward_port, chunk_size):
+    # Calculate the number of chunks needed
+    total_size = len(data)
+    for i in range(0, total_size, chunk_size):
+        chunk = data[i:i + chunk_size]
+        forward_socket.sendto(chunk, (forward_ip, forward_port))
+    #    print(f"Sent chunk of size: {len(chunk)} bytes")
+
+def is_valid_ipv4(ip):
+    try:
+        ipaddress.IPv4Address(ip)
+        return True
+    except ipaddress.AddressValueError:
+        return False
+
+def is_valid_port(port):
+    try:
+        port = int(port)
+        return 1 <= port <= 65535
+    except ValueError:
+        return False
+    
+def is_valid_json(payload):
+    try:
+        json.loads(payload)
+        return True
+    except json.JSONDecodeError:
+        return False
+
+def task():
+    if stop_event.is_set():
+        print("Total amount of messages: " + str(msgCount))
+        print("Amount of chunks: " + str(chunk_counter))
+        print("Amount of unidentified messages: " + str(unidentified_data_counter))
+        print("..done.")
+        return # Return and interrupt cycle
+    
+    from datetime import datetime
+    now = datetime.now()
+    current_time = now.strftime("%H:%M:%S")
+    print(f"")
+    print(f"Current Time = " + current_time)
+    print("Total amount of messages: " + str(msgCount))
+    print("Amount of chunks: " + str(chunk_counter))
+    print("Amount of unidentified messages: " + str(unidentified_data_counter))
+    sys.stdout.flush()
+    # Re-schedule the timer
+    threading.Timer(30, task).start()
+
+
+
+# MAIN PROGRAM
+
+print("Starting up. Version: " + VERSION)
+# Check that all required environmental variables are set
+required_vars = ["FORWARD_IP", "FORWARD_PORT", "LISTEN_PORT"]
+
+for var in required_vars:
+    value = os.getenv(var)
+    if not value:
+        print(f"Error: Environment variable {var} is not set. Exiting..")
+        sys.exit(1)
+
+# IP address and port used for forwarding
+if is_valid_ipv4(os.getenv('FORWARD_IP')):
+    ff_ip_address = os.getenv('FORWARD_IP')
+else:
+    print("IP address is not valid")
+    sys.exit(1)
+
+if is_valid_port(os.getenv('FORWARD_PORT')):
+    ff_port = int(os.getenv('FORWARD_PORT'))
+else:
+    print("Forwarding port is not valid")
+    sys.exit(1)
+
+if is_valid_port(os.getenv('LISTEN_PORT')):
+    listen_port = int(os.getenv('LISTEN_PORT'))
+else:
+    print("Listening port is not valid")
+    sys.exit(1)
+
+# Optional environmental variables for syslog's APP-NAME, PROCID and MSGID
+app_name = os.getenv('APP_NAME')
+procid = os.getenv('PROCID')
+msgid = os.getenv('MSGID')
+
+# Set up the UDP socket for listening
+try:
+    listen_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    listen_socket.bind(("0.0.0.0", listen_port))
+except socket.error as e:
+    print(f"Socket error during setup: {e}")
+    sys.exit(1)  # Exit if the socket can't be set up
+except Exception as e:
+    print(f"Unexpected error during socket setup: {e}")
+    sys.exit(1)    
+
+msgCount = 0
+chunk_counter = 0
+unidentified_data_counter = 0
+
+gelf_store = GELFChunkStore() # Create store for GELF chunks
+
+# Set up the UDP socket for forwarding
+try:
+    forward_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+except socket.error as e:
+    print(f"Socket error during forwarder creation: {e}")
+    sys.exit(1)
+
+print(f"Listening for UDP packets on port {listen_port} and forwarding to {ff_ip_address}:{ff_port}")
+
+# Start the first timer
+task()
+
+try:
+    while True:
+        # Receive data from the listening port
+        data, addr = listen_socket.recvfrom(RCV_BUFFER_SIZE)  # Buffer size of RCV_BUFFER_SIZE bytes
+        data_size = 0
+        data_size = len(data)
+        #print(f"Size of data: {data_size} bytes")
+        #print(f"Received packet from {addr}: {data}")
+
+        # Decompress GZIP data if present
+        decompressed_data = extract_gzip_data(data)
+        if decompressed_data: # If data was GZIP..
+            data = decompressed_data # ..copy it to data
+
+        only_chunk_stored_no_data = False
+        # Chunk handling BEGIN
+        if is_data_gelf_chunk(data): # Check if Magic Bytes are GELF (x1e x0f)
+            try:
+                # Check if payload is GZIP
+                gelf_store.add_chunk(data[3:9],data[10],data[11],data[12:])
+                
+                if gelf_store.is_complete(data[3:9]):
+                    data = gelf_store.get_message(data[3:9])
+                    if is_data_gzip_compressed(data):
+                        data = extract_gzip_data(data)
+                else:
+                    only_chunk_stored_no_data = True    
+            except Exception as e:
+                print("Error adding GELF chunk: ", e)
+            finally:
+                expired_message_ids = gelf_store.cleanup_expired()
+                #print("Expired message IDs:", expired_message_ids)
+        # Chunk handling END
+
+        if only_chunk_stored_no_data:
+            chunk_counter += 1
+            #print(f"Chunk #", chunk_counter)
+        else:    
+            # We have the data - it is decompressed (if it was zipped) and it should be full GELF message (even if it was chunked). Before handling message further, check that it is json format
+            decoded_data = data.decode("utf-8")
+            if is_valid_json(decoded_data):
+                gelf_complete_message = json.loads(decoded_data)
+                gelf_version = find_json_value_by_key(gelf_complete_message,"version")
+                gelf_host = find_json_value_by_key(gelf_complete_message,"host")
+                gelf_short_message = find_json_value_by_key(gelf_complete_message,"short_message")  
+            else:
+                print("Received non-JSON payload: ", decoded_data)
+                gelf_version = None
+
+            msgCount += 1
+            # Convert received GELF message to RFC5424 syslog BEGIN
+            #gelf_complete_message = json.loads(data.decode("utf-8")) # Convert byte string 'b' to string 'utf-8' and then to Python Dictionary
+            try:
+                if (gelf_version is None or gelf_host is None or gelf_short_message is None): # If mandatory key value is not found, just pass the data
+                    send_large_data(forward_socket,data,ff_ip_address,ff_port,MAX_UDP_CHUNK_SEND_SIZE)
+                    unidentified_data_counter += 1
+                else:
+                    structured_data = NILVALUE # In case of zero structured data elements, the STRUCTURED-DATA field MUST contain the NILVALUE
+                    gelf_full_message = find_json_value_by_key(gelf_complete_message,"full_message")
+                    gelf_timestamp = find_json_value_by_key(gelf_complete_message,"timestamp")
+                    gelf_level = find_json_value_by_key(gelf_complete_message,"level")
+                    gelf_facility  = find_json_value_by_key(gelf_complete_message,"facility")
+                    gelf_line  = find_json_value_by_key(gelf_complete_message,"line")
+                    gelf_file = find_json_value_by_key(gelf_complete_message,"file")
+                    # Priority value. "local use 7" facility used, severity "Informational" if no GELF level found
+                    if (gelf_level is not None):
+                        syslog_pri = "<" + str(SYSLOG_FACILITY_LOCAL_USE_7 * 8 + gelf_level) + ">"
+                    else:
+                        syslog_pri = "<" + str(SYSLOG_FACILITY_LOCAL_USE_7 * 8 + SYSLOG_SEVERITY_INFORMATIONAL) + ">"
+
+                    # Some of the GELF message fiels are optional. Structured data is used for those
+                    if gelf_level is not None:
+                        if structured_data == NILVALUE:
+                            structured_data = "[GELFoptional@32473 level=" + '"' + str(gelf_level) + '"'
+                        else:
+                            structured_data += " " + "level=" + str(gelf_level) + '"'
+
+                    if gelf_facility is not None:
+                        if structured_data == NILVALUE:
+                            structured_data += "[GELFoptional@32473 facility=" + '"' + gelf_facility + '"'
+                        else:
+                            structured_data += " " + "facility=" + gelf_facility + '"'
+
+                    if gelf_line is not None:
+                        if structured_data == NILVALUE:
+                            structured_data += "[GELFoptional@32473 line=" + '"' + str(gelf_line) + '"'
+                        else:
+                            structured_data += " " + "line=" + '"' + str(gelf_line) + '"'
+
+                    if gelf_file is not None:
+                        if structured_data == NILVALUE:
+                            structured_data += "[GELFoptional@32473 file=" + '"' + gelf_file + '"'
+                        else:
+                            structured_data += " " + "file=" + '"' + gelf_file + '"'
+
+                    if structured_data != NILVALUE: # Structured data handling for GELFoptional@32473 end and if exists end bracket is added
+                        structured_data += "]"
+                    
+                    # full_message has its own Structured Data unit
+                    if gelf_full_message is not None:
+                        if structured_data == NILVALUE:
+                            structured_data = "[GELFfullmessage@32473 full_message=" + '"' + str(gelf_full_message) + '"]'
+                        else:
+                            structured_data += "[GELFfullmessage@32473 full_message=" + '"' + str(gelf_full_message) + '"]'
+
+                    my_syslog_message = syslog_pri + str(SYSLOG_VERSION) # Add version                    
+                    # Add timestamp to syslog message
+                    # The "timeQuality" SD-ID described in RFC5424 Section 7.1 allows the originator to specify the accuracy and trustworthiness of the timestamp
+                    timestamp = ""
+                    if (gelf_timestamp is None): # We use local timestamp but use "timeQuality" to inform receiver that time is not correct
+                        from datetime import datetime, timezone
+                        # Get current UTC time and format as RFC 5424-compliant timestamp
+                        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+                        print("No timestamp from GELF. Local UTC time used " + timestamp)
+                        my_syslog_message += " " + timestamp
+                        if structured_data == NILVALUE:
+                            structured_data = '[timeQuality tzKnown="0" isSynced="0"]'
+                        else:
+                            structured_data += '[timeQuality tzKnown="0" isSynced="0"]'
+                    else:
+                        timestamp = convert_gelf_to_syslog_timestamp(gelf_timestamp)
+                        #print("Timestamp found " + timestamp)
+                        my_syslog_message += " " + timestamp
+
+                    # Host is mandatory field of GELF ("host") and because we are executing here, we have content in gelf_host. Simply add hostname to message
+                    my_syslog_message += " " + gelf_host
+
+                    # APP-NAME is not part of GELF message nor mandatory on SYSLOG. Add NILVALUE
+                    if app_name is not None:
+                        my_syslog_message += " " + str(app_name)
+                    else:
+                        my_syslog_message += " " + NILVALUE
+
+                    # PROCID is not part of GELF message nor mandatory on SYSLOG. Add NILVALUE
+                    if procid is not None:
+                        my_syslog_message += " " + str(procid)
+                    else:                        
+                        my_syslog_message += " " + NILVALUE
+
+                    # MSGID is not part of GELF message nor mandatory on SYSLOG. Add NILVALUE
+                    if msgid is not None:
+                        my_syslog_message += " " + str(msgid)
+                    else:
+                        my_syslog_message += " " + NILVALUE
+
+                    # STRUCTURED-DATA
+                    my_syslog_message += " " + structured_data
+
+                    # The MSG part contains a free-form message. Mandatory part of GELF message "short_message" used
+                    my_syslog_message += " " + gelf_short_message
+
+                    send_large_data(forward_socket,my_syslog_message.encode("utf-8"),ff_ip_address,ff_port,MAX_UDP_CHUNK_SEND_SIZE)    
+            except Exception as e:
+                print("Error occurred while building the syslog message: ", e)
+            #finally:
+            #    print(f"Forwarded packet to {ff_ip_address}:{ff_port}")
+
+
+except KeyboardInterrupt:
+    stop_event.set()
+    print(" ")
+    print(" ")
+    print("Shutting down jumazuca..")
+ 
+finally:
+    # Close the sockets when done
+    listen_socket.close()
+    forward_socket.close()
